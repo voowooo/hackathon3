@@ -1,0 +1,5 @@
+path: /Users/uwgin/Desktop/untitled folder 2/dataset
+train: images/train
+val: images/val
+names:
+  0: truck
