@@ -183,6 +183,7 @@ def truck_box_corners(center, heading, size, centered=False):
     return np.array(pts)
 
 def box2d_from_3d(P, corners, W, H):
+    """2D-габарит проекции 3D-коробки (для метрик и синтетики)."""
     uv, zs = zip(*[project(P, c) for c in corners])
     if min(zs) <= 0:
         return None
@@ -190,6 +191,30 @@ def box2d_from_3d(P, corners, W, H):
     x1, y1 = uv.min(0); x2, y2 = uv.max(0)
     if x2 < 0 or y2 < 0 or x1 > W or y1 > H:
         return None
+    return x1, y1, x2, y2
+
+# 12 рёбер кубоида: вершины пронумерованы битами (4=длина, 2=ширина, 1=высота)
+BOX_EDGES = [(i, i ^ d) for d in (4, 2, 1) for i in range(8) if not (i & d)]
+
+def draw_box3d(img, P, corners, color, thickness=2):
+    """Рисует 3D-bounding box вокруг грузовика: 12 рёбер + 8 углов.
+    Дальние рёбра тоньше и тусклее, ближние — жирнее. Возвращает 2D-габарит или None."""
+    uv, zs = zip(*[project(P, c) for c in corners])
+    zs = np.asarray(zs, float)
+    if (zs <= 0).any():            # часть коробки за камерой — не рисуем
+        return None
+    uv = np.asarray(uv, float)
+    zmin, zmax = zs.min(), zs.max()
+    span = max(zmax - zmin, 1e-6)
+    for i, j in BOX_EDGES:
+        # 1.0 у ближних рёбер, 0.35 у дальних
+        k = 1.0 - 0.65 * (min(zs[i], zs[j]) - zmin) / span
+        t = max(1, int(round(thickness * (0.5 + 0.5 * k))))
+        c = tuple(int(round(v * (0.55 + 0.45 * k))) for v in color)
+        cv2.line(img, tuple(np.round(uv[i]).astype(int)), tuple(np.round(uv[j]).astype(int)), c, t, cv2.LINE_AA)
+    for p in uv.astype(int):       # углы
+        cv2.circle(img, tuple(p), max(2, thickness + 1), color, -1, cv2.LINE_AA)
+    x1, y1 = uv.min(0); x2, y2 = uv.max(0)
     return x1, y1, x2, y2
 
 # ---------------------------------------------------------------- основной конвейер
@@ -227,6 +252,24 @@ def run(args):
             print(f"кадр {t}/{nfr}")
     finish(args, cams, meas, ninl, rerr, W, H, nfr)
 
+def headings_from_velocity(vel, min_speed=5.0):
+    """Курс грузовика (рад, в плоскости XY) из скорости; на медленных кадрах — последний известный."""
+    h, last = np.zeros(len(vel)), 0.0
+    for t, v in enumerate(vel):
+        if np.linalg.norm(v[:2]) > min_speed:
+            last = np.arctan2(v[1], v[0])
+        h[t] = last
+    return h
+
+def boxes3d(pos, vel, size):
+    """8 углов 3D-коробки вокруг грузовика на каждый кадр: (N,8,3), NaN где нет позиции."""
+    heads = headings_from_velocity(vel)
+    out = np.full((len(pos), 8, 3), np.nan)
+    for t in range(len(pos)):
+        if not np.isnan(pos[t]).any():
+            out[t] = truck_box_corners(pos[t], heads[t], size, centered=True)
+    return out, heads
+
 def finish(args, cams, meas, ninl, rerr, W, H, nfr, dets=None):
     pos, vel, status = kalman_rts(meas)
     t = np.arange(nfr)
@@ -234,6 +277,15 @@ def finish(args, cams, meas, ninl, rerr, W, H, nfr, dets=None):
                        "raw_x": meas[:, 0], "raw_y": meas[:, 1], "raw_z": meas[:, 2],
                        "n_cams": ninl, "reproj_px": rerr, "status": status})
     df.to_csv(os.path.join(args.out, "trajectory.csv"), index=False)
+    # 3D bounding box: центр, курс, габариты и 8 углов в мировых координатах (см)
+    corners, heads = boxes3d(pos, vel, args.truck_size)
+    L, Wd, Ht = args.truck_size
+    box = pd.DataFrame({"frame": t, "x_cm": pos[:, 0], "y_cm": pos[:, 1], "z_cm": pos[:, 2],
+                        "yaw_deg": np.degrees(heads), "length_cm": L, "width_cm": Wd, "height_cm": Ht})
+    for k in range(8):
+        for j, ax in enumerate("xyz"):
+            box[f"c{k}_{ax}"] = corners[:, k, j]
+    box.to_csv(os.path.join(args.out, "bbox3d.csv"), index=False)
     # графики X(t), Y(t), Z(t)
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
@@ -263,22 +315,19 @@ def write_overlay(args, cams, pos, vel, status, W, H, nfr):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     vw = cv2.VideoWriter(os.path.join(args.out, f"overlay_cam{args.overlay_cam}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
     d_, f_, s_ = cams[ci]
-    last_h = 0.0
+    corners, _ = boxes3d(pos, vel, args.truck_size)
     for t in range(nfr):
         ok, frame = cap.read()
         if not ok:
             break
         if not np.isnan(pos[t]).any():
             P = projection_matrix(d_.iloc[t], f_, s_, W, H)
-            sp = np.linalg.norm(vel[t][:2])
-            if sp > 5: last_h = np.arctan2(vel[t][1], vel[t][0])
-            b = box2d_from_3d(P, truck_box_corners(pos[t], last_h, args.truck_size, centered=True), W, H)
+            col = (0, 255, 0) if status[t] == "tracked" else (0, 165, 255)
+            b = draw_box3d(frame, P, corners[t], col, args.box_thickness)
             if b is not None:
-                x1, y1, x2, y2 = map(int, b)
-                col = (0, 255, 0) if status[t] == "tracked" else (0, 165, 255)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), col, 3)
-                cv2.putText(frame, f"{status[t]}  XYZ(m) {pos[t,0]/100:.1f} {pos[t,1]/100:.1f} {pos[t,2]/100:.1f}", (max(x1, 5), max(y1 - 8, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, .7, col, 2)
+                x1, y1, x2, y2 = b
+                cv2.putText(frame, f"{status[t]}  XYZ(m) {pos[t,0]/100:.1f} {pos[t,1]/100:.1f} {pos[t,2]/100:.1f}", (max(int(x1), 5), max(int(y1) - 8, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .7, col, 2, cv2.LINE_AA)
         vw.write(frame)
     vw.release()
 
@@ -299,7 +348,7 @@ def selftest(args, cams):
             fr = np.full((H, W, 3), 90, np.uint8)
             X = tr.iloc[t].values; Vv = tr.iloc[min(t + 1, nfr - 1)].values - X
             h = np.arctan2(Vv[1], Vv[0]) if np.linalg.norm(Vv[:2]) > 1e-6 else 0
-            b = box2d_from_3d(projection_matrix(d_.iloc[t], f_, s_, W, H), truck_box_corners(X, h, size), W, H)
+            b = box2d_from_3d(projection_matrix(d_.iloc[t], f_, s_, W, H), truck_box_corners(X, h, size, centered=True), W, H)
             if b is not None:
                 x1, y1, x2, y2 = [int(round(v)) for v in b]
                 cv2.rectangle(fr, (x1, y1), (x2, y2), (255, 0, 255), -1)
@@ -327,7 +376,8 @@ if __name__ == "__main__":
     ap.add_argument("--videos", nargs="+", default=[])
     ap.add_argument("--cams", nargs="+", required=True, help="CSV камер в том же порядке, что и видео")
     ap.add_argument("--truth", help="CSV эталонной траектории (необязательно, для оценки ошибки)")
-    ap.add_argument("--overlay-cam", type=int, default=5, help="на какой камере рисовать bounding box (1..N), 0 = не рисовать")
+    ap.add_argument("--overlay-cam", type=int, default=5, help="на какой камере рисовать 3D bounding box (1..N), 0 = не рисовать")
+    ap.add_argument("--box-thickness", type=int, default=2, help="толщина ближних рёбер 3D bounding box, px")
     ap.add_argument("--truck-size", nargs=3, type=float, default=[2080, 520, 750], help="длина ширина высота грузовика, см (оценка: модель 668x168x242 см, в сцене масштаб ~3.1)")
     ap.add_argument("--model", default="yolov8n.pt"); ap.add_argument("--cls", nargs="+", type=int, default=[7, 2, 5], help="id классов; для своей модели с одним классом: --cls 0"); ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--thr", type=float, default=8.0, help="порог reprojection error, px")
